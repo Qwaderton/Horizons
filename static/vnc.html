@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Horizons - VNC Console</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+        #toolbar { position: fixed; top: 0; left: 0; right: 0; background: #1a1a2e; padding: 10px; z-index: 100; display: flex; align-items: center; gap: 15px; }
+        #toolbar a { color: #00d4ff; text-decoration: none; }
+        #toolbar span { color: #888; font-size: 14px; }
+        .btn { padding: 6px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; background: #00d4ff; color: #000; }
+        .btn:hover { opacity: 0.8; }
+        #status { margin-left: auto; }
+        #screen { position: fixed; top: 50px; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; }
+        #canvas { background: #111; }
+        .msg { color: #888; }
+    </style>
+</head>
+<body>
+    <div id="toolbar">
+        <a href="/">← Back</a>
+        <button class="btn" id="ctrlAltDelBtn">Ctrl+Alt+Del</button>
+        <button class="btn" id="fullscreenBtn">Fullscreen</button>
+        <span id="status">Connecting...</span>
+    </div>
+    <div id="screen">
+        <canvas id="canvas"></canvas>
+        <div class="msg" id="message">Connecting to VM...</div>
+    </div>
+    <script>
+    (function() {
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const status = document.getElementById('status');
+        const message = document.getElementById('message');
+        let ws = null;
+        let connected = false;
+        let fbWidth = 800, fbHeight = 600;
+        let mouseX = 0, mouseY = 0, mouseButtons = 0;
+
+        // RFB Protocol constants
+        const RFB_FRAMEBUFFER_UPDATE = 0;
+        const RFB_SET_COLOR_MAP = 1;
+        const RFB_BELL = 2;
+        const RFB_SERVER_CUT_TEXT = 3;
+
+        // State machine
+        let state = 'version';
+        let buffer = new Uint8Array(0);
+        let pixelFormat = null;
+        let numRects = 0;
+        let currentRect = null;
+
+        function setStatus(text, color = '#888') {
+            status.textContent = text;
+            status.style.color = color;
+        }
+
+        function appendBuffer(newData) {
+            const tmp = new Uint8Array(buffer.length + newData.length);
+            tmp.set(buffer, 0);
+            tmp.set(newData, buffer.length);
+            buffer = tmp;
+        }
+
+        function consume(n) {
+            const data = buffer.slice(0, n);
+            buffer = buffer.slice(n);
+            return data;
+        }
+
+        function readU8(data, offset) { return data[offset]; }
+        function readU16(data, offset) { return (data[offset] << 8) | data[offset + 1]; }
+        function readU32(data, offset) { return (data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3]; }
+        function readS32(data, offset) { 
+            const val = readU32(data, offset);
+            return val > 0x7FFFFFFF ? val - 0x100000000 : val;
+        }
+
+        function writeU8(val) { return new Uint8Array([val]); }
+        function writeU16(val) { return new Uint8Array([(val >> 8) & 0xff, val & 0xff]); }
+        function writeU32(val) { return new Uint8Array([(val >> 24) & 0xff, (val >> 16) & 0xff, (val >> 8) & 0xff, val & 0xff]); }
+
+        function send(data) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(data);
+            }
+        }
+
+        function sendArray(arr) {
+            send(new Uint8Array(arr));
+        }
+
+        function connect() {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(proto + '//' + location.host + '/websockify');
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                setStatus('Handshaking...', '#ffa502');
+                message.style.display = 'none';
+                canvas.style.display = 'block';
+                state = 'version';
+                buffer = new Uint8Array(0);
+            };
+
+            ws.onmessage = (e) => {
+                appendBuffer(new Uint8Array(e.data));
+                processBuffer();
+            };
+
+            ws.onclose = () => {
+                connected = false;
+                setStatus('Disconnected', '#ff4757');
+                message.textContent = 'Disconnected. Reconnecting...';
+                message.style.display = 'block';
+                setTimeout(connect, 3000);
+            };
+
+            ws.onerror = () => {
+                setStatus('Error', '#ff4757');
+            };
+        }
+
+        function processBuffer() {
+            while (true) {
+                if (state === 'version') {
+                    if (buffer.length < 12) return;
+                    consume(12); // Server version
+                    send(new TextEncoder().encode('RFB 003.008\n'));
+                    state = 'security';
+                }
+                else if (state === 'security') {
+                    if (buffer.length < 1) return;
+                    const numTypes = readU8(buffer, 0);
+                    if (numTypes === 0) {
+                        if (buffer.length < 5) return;
+                        consume(5);
+                        setStatus('Auth failed', '#ff4757');
+                        return;
+                    }
+                    if (buffer.length < 1 + numTypes) return;
+                    consume(1 + numTypes);
+                    sendArray([1]); // None auth
+                    state = 'security_result';
+                }
+                else if (state === 'security_result') {
+                    if (buffer.length < 4) return;
+                    const result = readU32(buffer, 0);
+                    consume(4);
+                    if (result !== 0) {
+                        setStatus('Auth rejected', '#ff4757');
+                        return;
+                    }
+                    sendArray([1]); // Shared flag
+                    state = 'server_init';
+                }
+                else if (state === 'server_init') {
+                    if (buffer.length < 24) return;
+                    fbWidth = readU16(buffer, 0);
+                    fbHeight = readU16(buffer, 2);
+                    const bpp = readU8(buffer, 4);
+                    const depth = readU8(buffer, 5);
+                    const bigEndian = readU8(buffer, 6);
+                    const trueColor = readU8(buffer, 7);
+                    const nameLen = readU32(buffer, 20);
+                    if (buffer.length < 24 + nameLen) return;
+                    consume(24 + nameLen);
+
+                    canvas.width = fbWidth;
+                    canvas.height = fbHeight;
+                    resizeCanvas();
+
+                    // Set pixel format: 32-bit RGBX
+                    const pf = [0, // msg type
+                        0, 0, 0, // padding
+                        32, 24, 0, 1, // bpp, depth, big-endian, true-color
+                        0, 255, 0, 255, 0, 255, // r/g/b max
+                        16, 8, 0, // r/g/b shift
+                        0, 0, 0 // padding
+                    ];
+                    sendArray(pf);
+
+                    // Set encodings: Raw(0), CopyRect(1), Hextile(5)
+                    sendArray([2, 0, 0, 3,
+                        0, 0, 0, 1,  // CopyRect
+                        0, 0, 0, 5,  // Hextile
+                        0, 0, 0, 0   // Raw
+                    ]);
+
+                    connected = true;
+                    setStatus('Connected', '#00ff88');
+                    requestUpdate(false);
+                    state = 'normal';
+                }
+                else if (state === 'normal') {
+                    if (buffer.length < 1) return;
+                    const msgType = readU8(buffer, 0);
+
+                    if (msgType === RFB_FRAMEBUFFER_UPDATE) {
+                        if (buffer.length < 4) return;
+                        numRects = readU16(buffer, 2);
+                        consume(4);
+                        state = 'rect_header';
+                    }
+                    else if (msgType === RFB_SET_COLOR_MAP) {
+                        if (buffer.length < 6) return;
+                        const numColors = readU16(buffer, 4);
+                        if (buffer.length < 6 + numColors * 6) return;
+                        consume(6 + numColors * 6);
+                    }
+                    else if (msgType === RFB_BELL) {
+                        consume(1);
+                    }
+                    else if (msgType === RFB_SERVER_CUT_TEXT) {
+                        if (buffer.length < 8) return;
+                        const textLen = readU32(buffer, 4);
+                        if (buffer.length < 8 + textLen) return;
+                        consume(8 + textLen);
+                    }
+                    else {
+                        consume(1);
+                    }
+                }
+                else if (state === 'rect_header') {
+                    if (numRects === 0) {
+                        state = 'normal';
+                        requestUpdate(true);
+                        continue;
+                    }
+                    if (buffer.length < 12) return;
+                    currentRect = {
+                        x: readU16(buffer, 0),
+                        y: readU16(buffer, 2),
+                        w: readU16(buffer, 4),
+                        h: readU16(buffer, 6),
+                        encoding: readS32(buffer, 8)
+                    };
+                    consume(12);
+                    numRects--;
+
+                    if (currentRect.encoding === 0) { // Raw
+                        state = 'rect_raw';
+                    } else if (currentRect.encoding === 1) { // CopyRect
+                        state = 'rect_copyrect';
+                    } else if (currentRect.encoding === 5) { // Hextile
+                        currentRect.tileX = 0;
+                        currentRect.tileY = 0;
+                        currentRect.bgColor = [0, 0, 0, 255];
+                        currentRect.fgColor = [255, 255, 255, 255];
+                        state = 'rect_hextile';
+                    } else {
+                        state = 'rect_header';
+                    }
+                }
+                else if (state === 'rect_raw') {
+                    const bytes = currentRect.w * currentRect.h * 4;
+                    if (buffer.length < bytes) return;
+                    const data = consume(bytes);
+                    const img = ctx.createImageData(currentRect.w, currentRect.h);
+                    for (let i = 0; i < currentRect.w * currentRect.h; i++) {
+                        img.data[i * 4] = data[i * 4 + 2];
+                        img.data[i * 4 + 1] = data[i * 4 + 1];
+                        img.data[i * 4 + 2] = data[i * 4];
+                        img.data[i * 4 + 3] = 255;
+                    }
+                    ctx.putImageData(img, currentRect.x, currentRect.y);
+                    state = 'rect_header';
+                }
+                else if (state === 'rect_copyrect') {
+                    if (buffer.length < 4) return;
+                    const srcX = readU16(buffer, 0);
+                    const srcY = readU16(buffer, 2);
+                    consume(4);
+                    const imgData = ctx.getImageData(srcX, srcY, currentRect.w, currentRect.h);
+                    ctx.putImageData(imgData, currentRect.x, currentRect.y);
+                    state = 'rect_header';
+                }
+                else if (state === 'rect_hextile') {
+                    const tileW = Math.min(16, currentRect.w - currentRect.tileX);
+                    const tileH = Math.min(16, currentRect.h - currentRect.tileY);
+                    
+                    if (buffer.length < 1) return;
+                    const subenc = readU8(buffer, 0);
+                    let offset = 1;
+                    let needed = 1;
+
+                    if (subenc & 1) { // Raw
+                        needed += tileW * tileH * 4;
+                        if (buffer.length < needed) return;
+                        consume(1);
+                        const data = consume(tileW * tileH * 4);
+                        const img = ctx.createImageData(tileW, tileH);
+                        for (let i = 0; i < tileW * tileH; i++) {
+                            img.data[i * 4] = data[i * 4 + 2];
+                            img.data[i * 4 + 1] = data[i * 4 + 1];
+                            img.data[i * 4 + 2] = data[i * 4];
+                            img.data[i * 4 + 3] = 255;
+                        }
+                        ctx.putImageData(img, currentRect.x + currentRect.tileX, currentRect.y + currentRect.tileY);
+                    } else {
+                        if (subenc & 2) needed += 4; // bg
+                        if (subenc & 4) needed += 4; // fg
+                        if (subenc & 8) needed += 1; // num subrects
+                        if (buffer.length < needed) return;
+
+                        offset = 1;
+                        if (subenc & 2) {
+                            currentRect.bgColor = [buffer[offset + 2], buffer[offset + 1], buffer[offset], 255];
+                            offset += 4;
+                        }
+                        if (subenc & 4) {
+                            currentRect.fgColor = [buffer[offset + 2], buffer[offset + 1], buffer[offset], 255];
+                            offset += 4;
+                        }
+
+                        ctx.fillStyle = `rgb(${currentRect.bgColor[0]},${currentRect.bgColor[1]},${currentRect.bgColor[2]})`;
+                        ctx.fillRect(currentRect.x + currentRect.tileX, currentRect.y + currentRect.tileY, tileW, tileH);
+
+                        if (subenc & 8) {
+                            const numSubrects = buffer[offset++];
+                            const subrectSize = (subenc & 16) ? 6 : 2;
+                            needed += numSubrects * subrectSize;
+                            if (buffer.length < needed) return;
+
+                            for (let i = 0; i < numSubrects; i++) {
+                                let color = currentRect.fgColor;
+                                if (subenc & 16) {
+                                    color = [buffer[offset + 2], buffer[offset + 1], buffer[offset], 255];
+                                    offset += 4;
+                                }
+                                const xy = buffer[offset++];
+                                const wh = buffer[offset++];
+                                const sx = (xy >> 4) & 0xf;
+                                const sy = xy & 0xf;
+                                const sw = ((wh >> 4) & 0xf) + 1;
+                                const sh = (wh & 0xf) + 1;
+                                ctx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+                                ctx.fillRect(currentRect.x + currentRect.tileX + sx, currentRect.y + currentRect.tileY + sy, sw, sh);
+                            }
+                        }
+                        consume(needed);
+                    }
+
+                    // Next tile
+                    currentRect.tileX += 16;
+                    if (currentRect.tileX >= currentRect.w) {
+                        currentRect.tileX = 0;
+                        currentRect.tileY += 16;
+                    }
+                    if (currentRect.tileY >= currentRect.h) {
+                        state = 'rect_header';
+                    }
+                }
+                else {
+                    break;
+                }
+            }
+        }
+
+        function requestUpdate(incremental) {
+            sendArray([3, incremental ? 1 : 0, 0, 0, 0, 0,
+                (fbWidth >> 8) & 0xff, fbWidth & 0xff,
+                (fbHeight >> 8) & 0xff, fbHeight & 0xff
+            ]);
+        }
+
+        function sendKey(down, key) {
+            sendArray([4, down ? 1 : 0, 0, 0,
+                (key >> 24) & 0xff, (key >> 16) & 0xff, (key >> 8) & 0xff, key & 0xff
+            ]);
+        }
+
+        function sendPointer(x, y, buttons) {
+            sendArray([5, buttons, (x >> 8) & 0xff, x & 0xff, (y >> 8) & 0xff, y & 0xff]);
+        }
+
+        function resizeCanvas() {
+            const screen = document.getElementById('screen');
+            const maxW = screen.clientWidth - 20;
+            const maxH = screen.clientHeight - 20;
+            const scale = Math.min(maxW / fbWidth, maxH / fbHeight, 1);
+            canvas.style.width = (fbWidth * scale) + 'px';
+            canvas.style.height = (fbHeight * scale) + 'px';
+        }
+
+        // Key mapping
+        const keyMap = {
+            'Backspace': 0xff08, 'Tab': 0xff09, 'Enter': 0xff0d, 'Escape': 0xff1b,
+            'Insert': 0xff63, 'Delete': 0xffff, 'Home': 0xff50, 'End': 0xff57,
+            'PageUp': 0xff55, 'PageDown': 0xff56,
+            'ArrowLeft': 0xff51, 'ArrowUp': 0xff52, 'ArrowRight': 0xff53, 'ArrowDown': 0xff54,
+            'F1': 0xffbe, 'F2': 0xffbf, 'F3': 0xffc0, 'F4': 0xffc1, 'F5': 0xffc2,
+            'F6': 0xffc3, 'F7': 0xffc4, 'F8': 0xffc5, 'F9': 0xffc6, 'F10': 0xffc7,
+            'F11': 0xffc8, 'F12': 0xffc9,
+            'ShiftLeft': 0xffe1, 'ShiftRight': 0xffe2,
+            'ControlLeft': 0xffe3, 'ControlRight': 0xffe4,
+            'AltLeft': 0xffe9, 'AltRight': 0xffea,
+            'MetaLeft': 0xffeb, 'MetaRight': 0xffec
+        };
+
+        function getKeysym(e) {
+            if (keyMap[e.code]) return keyMap[e.code];
+            if (e.key.length === 1) return e.key.charCodeAt(0);
+            return null;
+        }
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (!connected) return;
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = fbWidth / rect.width;
+            const scaleY = fbHeight / rect.height;
+            mouseX = Math.floor((e.clientX - rect.left) * scaleX);
+            mouseY = Math.floor((e.clientY - rect.top) * scaleY);
+            if (e.button === 0) mouseButtons |= 1;
+            if (e.button === 1) mouseButtons |= 2;
+            if (e.button === 2) mouseButtons |= 4;
+            sendPointer(mouseX, mouseY, mouseButtons);
+            e.preventDefault();
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            if (!connected) return;
+            if (e.button === 0) mouseButtons &= ~1;
+            if (e.button === 1) mouseButtons &= ~2;
+            if (e.button === 2) mouseButtons &= ~4;
+            sendPointer(mouseX, mouseY, mouseButtons);
+            e.preventDefault();
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!connected) return;
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = fbWidth / rect.width;
+            const scaleY = fbHeight / rect.height;
+            mouseX = Math.floor((e.clientX - rect.left) * scaleX);
+            mouseY = Math.floor((e.clientY - rect.top) * scaleY);
+            sendPointer(mouseX, mouseY, mouseButtons);
+        });
+
+        canvas.addEventListener('wheel', (e) => {
+            if (!connected) return;
+            const btn = e.deltaY < 0 ? 8 : 16;
+            sendPointer(mouseX, mouseY, mouseButtons | btn);
+            setTimeout(() => sendPointer(mouseX, mouseY, mouseButtons), 50);
+            e.preventDefault();
+        });
+
+        canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+        document.addEventListener('keydown', (e) => {
+            if (!connected) return;
+            const keysym = getKeysym(e);
+            if (keysym) {
+                sendKey(true, keysym);
+                e.preventDefault();
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (!connected) return;
+            const keysym = getKeysym(e);
+            if (keysym) {
+                sendKey(false, keysym);
+                e.preventDefault();
+            }
+        });
+
+        document.getElementById('ctrlAltDelBtn').addEventListener('click', () => {
+            if (!connected) return;
+            sendKey(true, 0xffe3);  // Ctrl
+            sendKey(true, 0xffe9);  // Alt
+            sendKey(true, 0xffff);  // Delete
+            setTimeout(() => {
+                sendKey(false, 0xffff);
+                sendKey(false, 0xffe9);
+                sendKey(false, 0xffe3);
+            }, 100);
+        });
+
+        document.getElementById('fullscreenBtn').addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen();
+            } else {
+                document.exitFullscreen();
+            }
+        });
+
+        window.addEventListener('resize', resizeCanvas);
+        canvas.style.display = 'none';
+        connect();
+    })();
+    </script>
+</body>
+</html>

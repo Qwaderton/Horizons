@@ -1,0 +1,35 @@
+# Caddyfile for Horizons
+# Replace vm.example.com with your domain
+
+vm.example.com {
+    # Automatic HTTPS via Let's Encrypt
+    
+    # Reverse proxy to Horizons
+    reverse_proxy localhost:8080 {
+        # WebSocket support for VNC
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+    
+    # Handle WebSocket upgrade for /websockify
+    @websocket {
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @websocket localhost:8080
+    
+    # Security headers
+    header {
+        X-Frame-Options DENY
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+    
+    # Logging
+    log {
+        output file /var/log/caddy/horizons.log
+        format json
+    }
+}
